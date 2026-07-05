@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>Khảo sát Người tiêu dùng</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  width: 100%; height: 100%; overflow: hidden;
+  background: #0f172a; font-family: 'Nunito', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  touch-action: manipulation; user-select: none; -webkit-user-select: none;
+}
+body { display: flex; align-items: center; justify-content: center; }
+#game-container { width: 100%; height: 100%; }
+#game-container canvas { display: block; }
+#survey-result {
+  display: none; position: fixed; inset: 0; z-index: 999;
+  overflow-y: auto;
+  background: linear-gradient(180deg, #0f172a 0%, #172554 100%);
+  color: #eef2ff; padding: 16px;
+  padding-top: calc(16px + env(safe-area-inset-top));
+  padding-bottom: calc(16px + env(safe-area-inset-bottom));
+}
+.result-card {
+  width: min(760px, 100%); margin: 0 auto;
+  background: rgba(15,23,42,0.62); border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 20px; padding: 20px; backdrop-filter: blur(8px);
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  min-height:100vh; gap:14px;
+}
+#sheet-status {
+  display: flex; align-items: center; gap: 8px;
+  border-radius: 10px; padding: 10px 14px;
+  font-size: 0.9rem; font-weight: 700; margin-top: 10px;
+}
+#sheet-status.sending { background:rgba(250,204,21,0.15); color:#fde047; border:1px solid rgba(250,204,21,0.3); }
+#sheet-status.success { background:rgba(34,197,94,0.15);  color:#86efac; border:1px solid rgba(34,197,94,0.3); }
+#sheet-status.error   { background:rgba(239,68,68,0.15);  color:#fca5a5; border:1px solid rgba(239,68,68,0.3); }
+#loading-screen {
+  position: fixed; inset: 0; z-index: 1000; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:12px; background:#0f172a; color:#fde047;
+  font-family:'Nunito',Arial,sans-serif; font-weight:800; font-size:18px;
+}
+</style>
+</head>
+<body>
+<div id="loading-screen">🌿 Đang tải khảo sát...</div>
+
+<div id="survey-result">
+  <div class="result-card">
+    <div style="font-size:3.2rem;">🌿</div>
+    <h2 style="text-align:center; color:#fde047; font-weight:800; font-size:1.8rem; margin:0;">Cảm ơn bạn đã tham gia!</h2>
+    <p style="text-align:center; color:#cbd5e1; font-size:1.05rem; line-height:1.7; margin:0;">
+      Phản hồi của bạn đã được ghi nhận.<br>Chúc bạn một ngày tốt lành! 😊
+    </p>
+    <div id="sheet-status" class="sending">Đang gửi dữ liệu...</div>
+  </div>
+</div>
+
+<script>
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxjt2ngBtls-nLfIYy99LsWUNDFCBcqwf8j-xi7-_5iVsZGx4p6sW5IjqNeq3MzefuF/exec';
+const QUESTIONS_CSV_URL = './questions.csv';
+const FILTER_QUESTION_ID = null;
+const FILTER_FAIL_VALUE = null;
+
+const CFG = { CHAR_W:28, CHAR_H:38, GROUND_H:54, PLATFORM_W:96, PLATFORM_H:22, PLATFORM_ABOVE_GROUND:150, ROW_GAP:82 };
+
+let SURVEY_DATA = null;
+let surveyResponses = [];
+let finalOutput = null;
+let game = null;
+
+function parseCSVLine(line) {
+  const result = [];
+  let cur = '', inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { inQuotes = !inQuotes; continue; }
+    if (c === ',' && !inQuotes) { result.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  result.push(cur);
+  return result;
+}
+
+function buildOptionColor(idx, total, scaleType) {
+  const nominalPalette = [0x2980b9,0xd35400,0x7f8c8d,0x27ae60,0x8e44ad,0xf39c12,0xc0392b,0x16a085,0x2c3e50,0xe67e22,0x1abc9c,0x9b59b6];
+  const binaryPalette = { 0:0x22c55e, 1:0xef4444 };
+  if (total === 2 && scaleType !== 'Scale') return binaryPalette[idx] ?? nominalPalette[idx];
+  if (scaleType === 'Scale') {
+    const likertColors = [0xef4444,0xf97316,0xf59e0b,0xeab308,0xa3e635,0x4ade80,0x22c55e,0x14b8a6,0x06b6d4,0x38bdf8,0x6366f1,0x8b5cf6];
+    const step = (likertColors.length - 1) / Math.max(total - 1, 1);
+    return likertColors[Math.round(idx * step)];
+  }
+  return nominalPalette[idx % nominalPalette.length];
+}
+
+async function loadSurveyFromCSV() {
+  const res = await fetch(QUESTIONS_CSV_URL, { cache: 'no-store' });
+  if (!res.ok) throw new Error('Không tải được questions.csv, HTTP ' + res.status);
+  const buf = await res.arrayBuffer();
+  const text = new TextDecoder('utf-8').decode(buf);
+  const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length < 2) throw new Error('File questions.csv rỗng hoặc sai định dạng.');
+  const header = parseCSVLine(lines[0]).map(h => h.trim());
+  const idxQ = header.indexOf('Question_ID');
+  const idxText = header.indexOf('Question_Text');
+  const idxScale = header.indexOf('Scale_Type');
+  const optionCols = header.map((h, i) => ({h, i})).filter(o => o.h.startsWith('Option'));
+  if (idxQ === -1 || idxText === -1 || idxScale === -1) {
+    throw new Error('Thiếu cột bắt buộc: Question_ID / Question_Text / Scale_Type');
+  }
+
+  const questions = [];
+  for (let r = 1; r < lines.length; r++) {
+    const row = parseCSVLine(lines[r]);
+    if (!row[idxQ] || !row[idxQ].trim()) continue;
+    const scaleType = (row[idxScale] || '').trim();
+    const rawOptions = optionCols.map(o => (row[o.i] || '').trim()).filter(v => v !== '');
+    const n = rawOptions.length;
+    if (n < 2) { console.warn('Bỏ qua ' + row[idxQ] + ': ít hơn 2 lựa chọn'); continue; }
+    const isLikert = scaleType === 'Scale';
+    const isBinary = n === 2 && !isLikert;
+
+    const options = rawOptions.map((opt, i) => {
+      const codeMatch = opt.match(/^(\d+)\s*-/);
+      const value = codeMatch ? codeMatch[1] : String(i + 1);
+      const cleaned = opt.replace(/^\d+\s*-\s*/, '').trim();
+      return {
+        label: isLikert ? String(i + 1) : cleaned,
+        desc: isLikert ? cleaned : undefined,
+        value,
+        color: buildOptionColor(i, n, scaleType)
+      };
+    });
+
+    questions.push({
+      id: row[idxQ].trim(),
+      text: (row[idxText] || '').trim(),
+      type: isLikert ? 'likert' : (isBinary ? 'binary' : 'single'),
+      options
+    });
+  }
+  if (!questions.length) throw new Error('Không đọc được câu hỏi nào từ CSV.');
+  return { title: 'Khảo sát người tiêu dùng', questions };
+}
+
+function setSheetStatus(type, msg) {
+  const el = document.getElementById('sheet-status');
+  if (!el) return;
+  el.className = type;
+  el.textContent = msg;
+}
+
+function saveToLocalStorage(data) {
+  try {
+    const list = JSON.parse(localStorage.getItem('survey_backup') || '[]');
+    list.push({ data, savedAt: new Date().toISOString() });
+    localStorage.setItem('survey_backup', JSON.stringify(list));
+  } catch(e) { console.error('localStorage error:', e); }
+}
+
+function removeFromLocalStorage(index) {
+  try {
+    const list = JSON.parse(localStorage.getItem('survey_backup') || '[]');
+    list.splice(index, 1);
+    localStorage.setItem('survey_backup', JSON.stringify(list));
+  } catch(e) {}
+}
+
+async function postOnce(output) {
+  const res = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    keepalive: true,
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(output)
+  });
+  const text = await res.text();
+  let parsed;
+  try { parsed = JSON.parse(text); } catch(e) { parsed = { status: 'unknown', raw: text }; }
+  if (parsed.status !== 'success') throw new Error(parsed.message || 'Server trả về lỗi không xác định');
+  return parsed;
+}
+
+async function sendToGoogleSheets(output, attempt = 1) {
+  const MAX_ATTEMPTS = 3;
+  setSheetStatus('sending', 'Đang gửi dữ liệu...');
+  try {
+    await postOnce(output);
+    setSheetStatus('success', 'Đã gửi thành công!');
+    flushLocalBackup();
+    return true;
+  } catch (err) {
+    console.error('Lỗi gửi (lần ' + attempt + '):', err.message);
+    if (attempt < MAX_ATTEMPTS) {
+      await new Promise(r => setTimeout(r, attempt * 1000));
+      return sendToGoogleSheets(output, attempt + 1);
+    }
+    setSheetStatus('error', 'Không gửi được, đã lưu bản sao dự phòng.');
+    saveToLocalStorage(output);
+    return false;
+  }
+}
+
+async function flushLocalBackup() {
+  let list;
+  try { list = JSON.parse(localStorage.getItem('survey_backup') || '[]'); } catch(e) { return; }
+  if (!list.length) return;
+  for (let i = list.length - 1; i >= 0; i--) {
+    try {
+      await postOnce(list[i].data);
+      removeFromLocalStorage(i);
+    } catch(e) { /* vẫn còn lỗi, giữ lại */ }
+  }
+}
+
+class StartScene extends Phaser.Scene {
+  constructor() { super('StartScene'); }
+  create() {
+    const W = this.scale.width, H = this.scale.height;
+    const bg = this.add.graphics();
+    bg.fillGradientStyle(0x0f172a, 0x0f172a, 0x1e3a8a, 0x0f766e, 1);
+    bg.fillRect(0, 0, W, H);
+    for (let i = 0; i < 20; i++)
+      this.add.circle(Phaser.Math.Between(0,W), Phaser.Math.Between(0,H),
+        Phaser.Math.FloatBetween(1,2.6), 0xffffff, Phaser.Math.FloatBetween(0.15,0.55));
+    this.add.text(W/2, H*0.16, '🌿', { fontFamily:'Nunito,Arial,sans-serif', fontSize:'56px' }).setOrigin(0.5);
+    this.add.text(W/2, H*0.27, SURVEY_DATA.title, {
+      fontFamily:'Nunito,Arial,sans-serif', fontSize:'24px', fontStyle:'800',
+      color:'#fde047', align:'center', wordWrap:{width:W-40,useAdvancedWrap:true}
+    }).setOrigin(0.5);
+    this.add.text(W/2, H*0.40, `Gồm ${SURVEY_DATA.questions.length} câu hỏi. Chạm vào đáp án để nhân vật nhảy tới và chọn.`, {
+      fontFamily:'Nunito,Arial,sans-serif', fontSize:'16px', color:'#e2e8f0',
+      align:'center', wordWrap:{width:W-50,useAdvancedWrap:true}, lineSpacing:4
+    }).setOrigin(0.5);
+    const btn = this.add.text(W/2, H*0.68, ' BẮT ĐẦU ', {
+      fontFamily:'Nunito,Arial,sans-serif', fontSize:'24px', fontStyle:'800',
+      color:'#111827', backgroundColor:'#fde047', padding:{x:24,y:14}
+    }).setOrigin(0.5).setInteractive({useHandCursor:true});
+    this.tweens.add({targets:btn, scaleX:1.05, scaleY:1.05, duration:720, yoyo:true, repeat:-1});
+    btn.on('pointerdown', () => this.scene.start('GameScene'));
+  }
+}
+
+class GameScene extends Phaser.Scene {
+  constructor() { super('GameScene'); }
+
+  init() {
+    surveyResponses = [];
+    this.currentQ = 0;
+    this.transitioning = false;
+    this.platforms = [];
+    this.platformViews = [];
+    this.particles = [];
+  }
+
+  create() {
+    this.W = this.scale.width;
+    this.H = this.scale.height;
+    this.groundY = this.H - CFG.GROUND_H - CFG.CHAR_H / 2;
+    const bg = this.add.graphics();
+    bg.fillGradientStyle(0x081120, 0x0f172a, 0x10233f, 0x164e63, 1);
+    bg.fillRect(0, 0, this.W, this.H);
+    for (let i = 0; i < 28; i++)
+      this.add.circle(Phaser.Math.Between(0,this.W), Phaser.Math.Between(0,this.H),
+        Phaser.Math.FloatBetween(0.8,2.0), 0xffffff, Phaser.Math.FloatBetween(0.12,0.5));
+    this.groundGfx = this.add.graphics();
+    this.pfContainer = this.add.container(0, 0);
+    this.charGfx = this.add.graphics();
+    this.charX = this.W / 2;
+    this.charY = this.groundY;
+    this.facingRight = true;
+    this.createHUD();
+    this.createQuestionBubble();
+    this.createFeedbackText();
+    this.spawnPlatforms(this.currentQ);
+    this.updateQuestionUI();
+  }
+
+  createHUD() {
+    const hud = this.add.graphics();
+    hud.fillStyle(0x000000, 0.32);
+    hud.fillRect(0, 0, this.W, 56);
+    const track = this.add.graphics();
+    track.fillStyle(0xffffff, 0.12);
+    track.fillRoundedRect(12, 36, this.W-24, 10, 6);
+    this.progressFill = this.add.graphics();
+    this.hudLabel = this.add.text(this.W/2, 16, '', {
+      fontFamily:'Nunito,Arial,sans-serif', fontSize:'14px', fontStyle:'800', color:'#fde68a'
+    }).setOrigin(0.5);
+  }
+
+  createQuestionBubble() {
+    const bubbleY = 60, bubbleH = 136;
+    this.bubbleBg = this.add.graphics();
+    this.bubbleBg.fillStyle(0xffffff, 0.97);
+    this.bubbleBg.fillRoundedRect(10, bubbleY, this.W-20, bubbleH, 18);
+    this.bubbleBg.fillTriangle(
+      this.W/2-10, bubbleY+bubbleH, this.W/2+10, bubbleY+bubbleH, this.W/2, bubbleY+bubbleH+14);
+    this.questionText = this.add.text(this.W/2, bubbleY+26, '', {
+      fontFamily:'Nunito,Arial,sans-serif', fontSize:'15px', fontStyle:'800',
+      color:'#0f172a', align:'center', wordWrap:{width:this.W-50,useAdvancedWrap:true}, lineSpacing:5
+    }).setOrigin(0.5, 0);
+    this.helperText = this.add.text(this.W/2, bubbleY+108, '', {
+      fontFamily:'Nunito,Arial,sans-serif', fontSize:'11px', fontStyle:'700',
+      color:'#1e293b', backgroundColor:'#dbeafe', padding:{x:8,y:4},
+      align:'center', wordWrap:{width:this.W-70,useAdvancedWrap:true}
+    }).setOrigin(0.5).setVisible(false);
+  }
+
+  createFeedbackText() {
+    this.feedbackText = this.add.text(this.W/2, this.H*0.55, 'Cảm ơn!', {
+      fontFamily:'Nunito,Arial,sans-serif', fontSize:'26px', fontStyle:'800',
+      color:'#fef08a', backgroundColor:'rgba(15,23,42,0.75)', padding:{x:12,y:8}, align:'center'
+    }).setOrigin(0.5).setAlpha(0);
+  }
+
+  updateQuestionUI() {
+    const total = SURVEY_DATA.questions.length;
+    const q = SURVEY_DATA.questions[this.currentQ];
+    const pct = this.currentQ / total;
+    this.hudLabel.setText(`Câu ${this.currentQ+1}/${total}`);
+    this.progressFill.clear();
+    this.progressFill.fillStyle(0x22c55e, 1);
+    this.progressFill.fillRoundedRect(12, 36, (this.W-24)*pct, 10, 6);
+    this.questionText.setText(q.text);
+    if (q.type === 'likert') {
+      this.helperText.setText(`Thang đo: 1 = Thấp nhất, ${q.options.length} = Cao nhất`);
+      this.helperText.setVisible(true);
+    } else {
+      this.helperText.setVisible(false);
+    }
+  }
+
+  spawnPlatforms(qIndex) {
+    this.platformViews.forEach(p => { p.zone.destroy(); p.container.destroy(); });
+    this.platformViews = [];
+    this.platforms = [];
+    const q = SURVEY_DATA.questions[qIndex];
+    const opts = q.options;
+    const n = opts.length;
+    const baseY = this.groundY - CFG.PLATFORM_ABOVE_GROUND;
+
+    const cols = n > 6 ? Math.ceil(n / 2) : n;
+    const usable = this.W - 40;
+    const step = usable / cols;
+    const startX = 20 + step / 2;
+    const pfW = Math.min(CFG.PLATFORM_W, step - 14);
+
+    opts.forEach((opt, i) => {
+      const row = Math.floor(i / cols);
+      const col = i % cols;
+      const x = startX + col * step;
+      const y = baseY - row * CFG.ROW_GAP;
+      const cont = this.add.container(x, y);
+      const g = this.add.graphics();
+      g.fillStyle(opt.color, 1);
+      g.fillRoundedRect(-pfW/2, -CFG.PLATFORM_H/2, pfW, CFG.PLATFORM_H, 9);
+      g.fillStyle(0xffffff, 0.18);
+      g.fillRoundedRect(-pfW/2+4, -CFG.PLATFORM_H/2+3, pfW-8, 4, 3);
+      const labelBg = this.add.graphics();
+      const labelH = q.type==='likert' ? 38 : 28;
+      labelBg.fillStyle(0x0f172a, 0.82);
+      labelBg.fillRoundedRect(-pfW/2-2, -CFG.PLATFORM_H/2-labelH-6, pfW+4, labelH, 8);
+      const fontSize = q.type==='likert' ? '14px' : (opt.label.length>10?'9px':'11px');
+      const label = this.add.text(0, -CFG.PLATFORM_H/2-labelH+8, opt.label, {
+        fontFamily:'Nunito,Arial,sans-serif', fontSize, fontStyle:'800',
+        color:'#ffffff', align:'center', wordWrap:{width:pfW,useAdvancedWrap:true}, lineSpacing:2
+      }).setOrigin(0.5, 0);
+      cont.add([g, labelBg, label]);
+      if (q.type === 'likert' && opt.desc) {
+        const desc = this.add.text(0, -CFG.PLATFORM_H/2-labelH+24, opt.desc, {
+          fontFamily:'Nunito,Arial,sans-serif', fontSize:'7px', fontStyle:'700',
+          color:'#cbd5e1', align:'center', wordWrap:{width:pfW,useAdvancedWrap:true}
+        }).setOrigin(0.5, 0);
+        cont.add(desc);
+      }
+      const zoneH = labelH + CFG.PLATFORM_H + 20;
+      const zone = this.add.zone(x-pfW/2-6, y-CFG.PLATFORM_H/2-labelH-6, pfW+12, zoneH).setOrigin(0,0).setInteractive({useHandCursor:true});
+      zone.on('pointerdown', () => this.handleAnswerTap(opt, x, y, i));
+      this.tweens.add({ targets:cont, y:y-5, duration:980+i*70, yoyo:true, repeat:-1, ease:'Sine.easeInOut' });
+      this.pfContainer.add(cont);
+      this.platforms.push({x, y, option:opt, index:i});
+      this.platformViews.push({container:cont, zone});
+    });
+  }
+
+  handleAnswerTap(option, x, y, idx) {
+    if (this.transitioning) return;
+    this.transitioning = true;
+    this.facingRight = x >= this.charX;
+    const landingY = y - CFG.PLATFORM_H/2 - CFG.CHAR_H/2;
+    const peakY = landingY - 40;
+    const startX = this.charX, startY = this.charY;
+    const midX = (startX + x) / 2;
+    const sv = this.platformViews[idx];
+    if (sv) this.tweens.add({ targets:sv.container, scaleX:1.16, scaleY:1.16, duration:120, yoyo:true });
+    this.tweens.addCounter({
+      from:0, to:1, duration:520, ease:'Sine.easeInOut',
+      onUpdate: tween => {
+        const t = tween.getValue();
+        this.charX = Phaser.Math.Interpolation.Linear([startX, midX, x], t);
+        this.charY = Phaser.Math.Interpolation.QuadraticBezier(t, startY, peakY, landingY);
+      },
+      onComplete: () => {
+        this.charX = x; this.charY = landingY;
+        this.saveAnswer(option);
+        this.burst(this.charX, this.charY, option.color);
+        this.checkEarlyExitThenNext(option);
+      }
+    });
+  }
+
+  checkEarlyExitThenNext(option) {
+    const q = SURVEY_DATA.questions[this.currentQ];
+    const isFilterFail = FILTER_QUESTION_ID && q.id === FILTER_QUESTION_ID && String(option.value) === String(FILTER_FAIL_VALUE);
+    this.showThankYouThenNext(option, isFilterFail);
+  }
+
+  showThankYouThenNext(option, forceEnd) {
+    this.feedbackText.setText('Cảm ơn!').setAlpha(1).setScale(0.8);
+    this.tweens.add({ targets:this.feedbackText, alpha:1, scaleX:1, scaleY:1, duration:180, ease:'Back.Out' });
+    this.time.delayedCall(650, () => {
+      this.tweens.add({ targets:this.feedbackText, alpha:0, duration:180 });
+      if (forceEnd) { this.endGame(true); return; }
+      this.currentQ++;
+      if (this.currentQ >= SURVEY_DATA.questions.length) { this.endGame(false); return; }
+      this.charX = this.W/2; this.charY = this.groundY;
+      this.transitioning = false;
+      this.spawnPlatforms(this.currentQ);
+      this.updateQuestionUI();
+    });
+  }
+
+  saveAnswer(option) {
+    const q = SURVEY_DATA.questions[this.currentQ];
+    surveyResponses.push({
+      questionId: q.id,
+      questionText: q.text,
+      answerId: option.value,
+      answerLabel: option.label,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  endGame(skipped = false) {
+    const snapshotResponses = [...surveyResponses];
+    const output = {
+      survey: SURVEY_DATA.title,
+      completedAt: new Date().toISOString(),
+      endedEarly: skipped,
+      totalQuestions: SURVEY_DATA.questions.length,
+      answeredQuestions: snapshotResponses.length,
+      responses: snapshotResponses
+    };
+    finalOutput = output;
+
+    const resultEl = document.getElementById('survey-result');
+    if (resultEl) resultEl.style.display = 'block';
+
+    sendToGoogleSheets(output);
+
+    if (this.scene && this.scene.pause) this.scene.pause();
+  }
+
+  drawCharacter() {
+    const g = this.charGfx, x = this.charX, y = this.charY, f = this.facingRight?1:-1;
+    g.clear();
+    g.fillStyle(0x000000,0.18); g.fillEllipse(x, y+CFG.CHAR_H/2+3, CFG.CHAR_W+8, 8);
+    g.fillStyle(0x2563eb); g.fillRoundedRect(x-CFG.CHAR_W/2, y-CFG.CHAR_H/2+12, CFG.CHAR_W, CFG.CHAR_H-12, 6);
+    g.fillStyle(0xf1c27d); g.fillCircle(x, y-CFG.CHAR_H/2+8, 13);
+    g.fillStyle(0xffffff); g.fillCircle(x+f*4, y-CFG.CHAR_H/2+7, 4);
+    g.fillStyle(0x111827); g.fillCircle(x+f*5.4, y-CFG.CHAR_H/2+7, 2);
+    g.fillStyle(0x22c55e);
+    g.fillRoundedRect(x-14*f, y-CFG.CHAR_H/2-4, 24*f, 8, 4);
+    g.fillRect(x-17*f, y-CFG.CHAR_H/2+4, 28*f, 4);
+    g.fillStyle(0x1e3a8a);
+    g.fillRoundedRect(x-10, y+CFG.CHAR_H/2-12, 8, 12, 3);
+    g.fillRoundedRect(x+2, y+CFG.CHAR_H/2-12, 8, 12, 3);
+  }
+
+  drawGround() {
+    this.groundGfx.clear();
+    this.groundGfx.fillStyle(0x15803d,1);
+    this.groundGfx.fillRect(0, this.H-CFG.GROUND_H, this.W, CFG.GROUND_H);
+    this.groundGfx.fillStyle(0x4ade80,1);
+    this.groundGfx.fillRect(0, this.H-CFG.GROUND_H, this.W, 7);
+  }
+
+  burst(x, y, color=0xffffff) {
+    for (let i=0; i<10; i++) {
+      const dot = this.add.circle(x, y, Phaser.Math.Between(2,4), color, 0.95);
+      const a = Phaser.Math.FloatBetween(0, Math.PI*2);
+      const s = Phaser.Math.FloatBetween(70, 200);
+      this.particles.push({ obj:dot, x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s-80, life:0.55, maxLife:0.55 });
+    }
+  }
+
+  update(time, delta) {
+    const dt = delta/1000;
+    for (let i=this.particles.length-1; i>=0; i--) {
+      const p = this.particles[i];
+      p.life -= dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vy += 220*dt;
+      p.obj.setPosition(p.x, p.y).setAlpha(Math.max(0, p.life/p.maxLife));
+      if (p.life<=0) { p.obj.destroy(); this.particles.splice(i,1); }
+    }
+    this.drawCharacter();
+    this.drawGround();
+  }
+}
+
+window.addEventListener('DOMContentLoaded', async () => {
+  flushLocalBackup();
+  const loadingEl = document.getElementById('loading-screen');
+  try {
+    SURVEY_DATA = await loadSurveyFromCSV();
+    if (loadingEl) loadingEl.style.display = 'none';
+  } catch (e) {
+    console.error('Không tải được questions.csv:', e);
+    if (loadingEl) loadingEl.innerHTML = '⚠️ Lỗi tải bảng câu hỏi.<br><span style="font-size:13px;color:#cbd5e1;">Kiểm tra file questions.csv có nằm cùng thư mục với index.html không.</span>';
+    return;
+  }
+  game = new Phaser.Game({
+    type: Phaser.AUTO,
+    width: window.innerWidth, height: window.innerHeight,
+    parent: 'game-container',
+    backgroundColor: '#0f172a',
+    scene: [StartScene, GameScene],
+    scale: { mode: Phaser.Scale.RESIZE, autoCenter: Phaser.Scale.CENTER_BOTH }
+  });
+});
+
+document.addEventListener('touchmove', e => e.preventDefault(), { passive:false });
+</script>
+</body>
+</html>
